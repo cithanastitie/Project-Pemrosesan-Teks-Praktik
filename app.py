@@ -1,61 +1,88 @@
+import os
 import joblib
 import numpy as np
 from flask import Flask, render_template, request, jsonify
 import warnings
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
+
+# =========================
+# PATH AMAN (ANTI ERROR)
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "cyberbullying_model.pkl")
+VECTORIZER_PATH = os.path.join(BASE_DIR, "tfidf_vectorizer.pkl")
+
+model = None
+vectorizer = None
+load_error = None
 
 # =========================
 # LOAD MODEL & VECTORIZER
 # =========================
 def load_model_and_vectorizer():
+    global load_error
     try:
-        model = joblib.load('cyberbullying_model.pkl')
-        vectorizer = joblib.load('tfidf_vectorizer.pkl')
+        mdl = joblib.load(MODEL_PATH)
+        vec = joblib.load(VECTORIZER_PATH)
 
-        print("✅ Model dan TF-IDF vectorizer berhasil dimuat!")
-        return model, vectorizer
+        # VALIDASI TF-IDF SUDAH FIT
+        if not hasattr(vec, "idf_"):
+            raise ValueError(
+                "TF-IDF vectorizer belum di-fit (idf_ tidak ditemukan). "
+                "Pastikan vectorizer di-save setelah fit/fit_transform."
+            )
+
+        print("✅ Model dan TF-IDF vectorizer berhasil dimuat & valid!")
+        return mdl, vec
+
     except Exception as e:
-        print(f"❌ Error loading model: {e}")
+        load_error = str(e)
+        print(f"❌ Error loading model/vectorizer: {e}")
         return None, None
 
 
-# Load saat aplikasi dijalankan
 model, vectorizer = load_model_and_vectorizer()
 
 # =========================
 # ROUTES
 # =========================
-@app.route('/')
+@app.route("/")
 def home():
-    return render_template('index.html')
+    return render_template("index.html", error=load_error)
 
 
-@app.route('/predict', methods=['POST'])
+@app.route("/predict", methods=["POST"])
 def predict():
-    try:
-        text = request.form.get('text', '')
+    if model is None or vectorizer is None:
+        return render_template(
+            "index.html",
+            error=f"Model tidak siap digunakan: {load_error}"
+        )
 
-        if not text.strip():
+    try:
+        text = request.form.get("text", "").strip()
+
+        if not text:
             return render_template(
-                'index.html',
+                "index.html",
                 error="Masukkan teks terlebih dahulu!"
             )
 
-        # Transform teks ke TF-IDF
         text_vectorized = vectorizer.transform([text])
-
-        # Prediksi
         prediction = model.predict(text_vectorized)[0]
-        prediction_proba = model.predict_proba(text_vectorized)[0]
+
+        if hasattr(model, "predict_proba"):
+            prediction_proba = model.predict_proba(text_vectorized)[0]
+            confidence = round(float(prediction_proba[prediction]) * 100, 2)
+        else:
+            confidence = 100.0
 
         label = "Bullying" if prediction == 1 else "Tidak Bullying"
-        confidence = round(float(prediction_proba[prediction]) * 100, 2)
         color = "danger" if prediction == 1 else "success"
 
-        # Penjelasan & saran
         if prediction == 1:
             explanation = (
                 "Teks mengandung indikasi bullying berdasarkan pola "
@@ -78,7 +105,7 @@ def predict():
             ]
 
         return render_template(
-            'result.html',
+            "result.html",
             text=text,
             prediction=label,
             confidence=confidence,
@@ -89,57 +116,69 @@ def predict():
 
     except Exception as e:
         return render_template(
-            'index.html',
-            error=f"Terjadi error: {str(e)}"
+            "index.html",
+            error=f"Terjadi error saat prediksi: {str(e)}"
         )
 
 
 # =========================
-# API ENDPOINT (OPSIONAL)
+# API ENDPOINT
 # =========================
-@app.route('/api/predict', methods=['POST'])
+@app.route("/api/predict", methods=["POST"])
 def api_predict():
-    try:
-        data = request.get_json()
-        text = data.get('text', '')
+    if model is None or vectorizer is None:
+        return jsonify({
+            "error": "Model not ready",
+            "detail": load_error
+        }), 500
 
-        if not text.strip():
-            return jsonify({'error': 'Text is required'}), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        text = data.get("text", "").strip()
+
+        if not text:
+            return jsonify({"error": "Text is required"}), 400
 
         text_vectorized = vectorizer.transform([text])
         prediction = model.predict(text_vectorized)[0]
-        prediction_proba = model.predict_proba(text_vectorized)[0]
+
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(text_vectorized)[0]
+            confidence = float(probs[prediction])
+        else:
+            probs = [None, None]
+            confidence = 1.0
 
         return jsonify({
-            'text': text,
-            'prediction': 'Bullying' if prediction == 1 else 'Not Bullying',
-            'confidence': float(prediction_proba[prediction]),
-            'probabilities': {
-                'not_bullying': float(prediction_proba[0]),
-                'bullying': float(prediction_proba[1])
+            "text": text,
+            "prediction": "Bullying" if prediction == 1 else "Not Bullying",
+            "confidence": confidence,
+            "probabilities": {
+                "not_bullying": probs[0],
+                "bullying": probs[1]
             }
         })
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 # =========================
 # HEALTH CHECK
 # =========================
-@app.route('/health')
+@app.route("/health")
 def health_check():
-    if model is not None and vectorizer is not None:
-        return jsonify({
-            'status': 'healthy',
-            'model_loaded': True,
-            'vectorizer_loaded': True
-        })
-    return jsonify({'status': 'unhealthy'}), 500
+    return jsonify({
+        "status": "healthy" if model and vectorizer else "unhealthy",
+        "model_loaded": model is not None,
+        "vectorizer_loaded": vectorizer is not None,
+        "vectorizer_fitted": hasattr(vectorizer, "idf_") if vectorizer else False,
+        "error": load_error
+    })
 
 
 # =========================
-# RUN APP
+# LOCAL RUN ONLY
 # =========================
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(debug=False)
